@@ -3,6 +3,7 @@
 mod socket;
 mod middle;
 mod plain;
+mod addr_proto;
 
 #[cfg(feature = "hook")]
 mod hook;

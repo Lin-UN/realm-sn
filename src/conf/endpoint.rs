@@ -15,7 +15,12 @@ use super::{Config, NetConf, NetInfo};
 pub struct EndpointConf {
     pub listen: String,
 
+    #[serde(default)]
     pub remote: String,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
 
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -153,7 +158,11 @@ impl Config for EndpointConf {
 
     fn build(self) -> Self::Output {
         let laddr = self.build_local();
-        let raddr = self.build_remote();
+        let raddr = if self.remote.is_empty() {
+            RemoteAddr::DomainName(String::new(), 0)
+        } else {
+            self.build_remote()
+        };
 
         let extra_raddrs = self.extra_remotes.iter().map(|r| Self::build_remote_x(r)).collect();
 
@@ -178,6 +187,7 @@ impl Config for EndpointConf {
         // build left fields of bind_opts and conn_opts
         conn_opts.bind_address = self.build_send_through();
         conn_opts.bind_interface = self.interface;
+        conn_opts.remote_addr = self.remote_addr.as_ref().map(|r| Self::build_remote_x(r));
         bind_opts.bind_interface = self.listen_interface;
 
         EndpointInfo {
@@ -213,6 +223,7 @@ impl Config for EndpointConf {
         EndpointConf {
             listen,
             remote,
+            remote_addr: None,
             through,
             interface,
             listen_interface,

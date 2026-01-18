@@ -44,6 +44,7 @@ pub struct ConnectOpts {
     pub tcp_keepalive_probe: usize,
     pub bind_address: Option<SocketAddr>,
     pub bind_interface: Option<String>,
+    pub remote_addr: Option<RemoteAddr>,
 
     #[cfg(feature = "proxy")]
     pub proxy_opts: ProxyOpts,
@@ -120,6 +121,7 @@ impl Display for ConnectOpts {
             tcp_keepalive_probe,
             bind_address,
             bind_interface,
+            remote_addr: _,
 
             #[cfg(feature = "proxy")]
             proxy_opts,

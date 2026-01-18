@@ -70,6 +70,7 @@ impl From<LegacyConf> for FullConf {
             .map(|(listen, remote)| EndpointConf {
                 listen,
                 remote,
+                remote_addr: None,
                 through: None,
                 interface: None,
                 listen_interface: None,
