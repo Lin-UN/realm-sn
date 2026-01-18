@@ -11,7 +11,7 @@ use realm_core::kaminari::mix::{MixAccept, MixConnect};
 
 use super::{Config, NetConf, NetInfo};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointConf {
     pub listen: String,
 
@@ -142,7 +142,7 @@ impl EndpointConf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EndpointInfo {
     pub no_tcp: bool,
     pub use_udp: bool,
@@ -172,6 +172,7 @@ impl Config for EndpointConf {
             mut conn_opts,
             no_tcp,
             use_udp,
+            ..
         } = self.network.build();
 
         #[cfg(feature = "balance")]

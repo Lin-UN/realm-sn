@@ -59,6 +59,10 @@ pub struct NetConf {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_timeout: Option<usize>,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_bind_all_ips: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -67,6 +71,7 @@ pub struct NetInfo {
     pub conn_opts: ConnectOpts,
     pub no_tcp: bool,
     pub use_udp: bool,
+    pub auto_bind_all_ips: bool,
 }
 
 impl Config for NetConf {
@@ -77,7 +82,8 @@ impl Config for NetConf {
             no_tcp, use_udp, ipv6_only,
             send_mptcp, accept_mptcp,
             send_proxy, accept_proxy, send_proxy_version, accept_proxy_timeout,
-            tcp_keepalive, tcp_keepalive_probe, tcp_timeout, udp_timeout
+            tcp_keepalive, tcp_keepalive_probe, tcp_timeout, udp_timeout,
+            auto_bind_all_ips
         ]
     }
 
@@ -93,6 +99,7 @@ impl Config for NetConf {
 
         let no_tcp = unbox!(no_tcp);
         let use_udp = unbox!(use_udp);
+        let auto_bind_all_ips = unbox!(auto_bind_all_ips);
         let ipv6_only = unbox!(ipv6_only);
         let send_mptcp = unbox!(send_mptcp);
         let accept_mptcp = unbox!(accept_mptcp);
@@ -145,6 +152,7 @@ impl Config for NetConf {
             conn_opts,
             no_tcp,
             use_udp,
+            auto_bind_all_ips,
         }
     }
 
@@ -154,6 +162,7 @@ impl Config for NetConf {
 
         rst!(self, no_tcp, other);
         rst!(self, use_udp, other);
+        rst!(self, auto_bind_all_ips, other);
         rst!(self, ipv6_only, other);
         rst!(self, send_mptcp, other);
         rst!(self, accept_mptcp, other);
@@ -174,6 +183,7 @@ impl Config for NetConf {
 
         take!(self, no_tcp, other);
         take!(self, use_udp, other);
+        take!(self, auto_bind_all_ips, other);
         take!(self, ipv6_only, other);
         take!(self, send_mptcp, other);
         take!(self, accept_mptcp, other);
@@ -235,6 +245,7 @@ impl Config for NetConf {
             accept_proxy,
             send_proxy_version,
             accept_proxy_timeout,
+            auto_bind_all_ips: None,
         }
     }
 }

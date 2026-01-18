@@ -4,15 +4,33 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAGIC: u16 = 0xAA55;
+const MAGIC_UDP: u16 = 0xAA56;  // UDP over TCP protocol
 const TYPE_IPV4: u8 = 0x01;
 const TYPE_IPV6: u8 = 0x02;
 const TYPE_DOMAIN: u8 = 0x03;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolType {
+    Tcp,
+    UdpOverTcp,
+}
 
 pub async fn send_target_addr<S>(stream: &mut S, addr: &RemoteAddr) -> Result<()>
 where
     S: AsyncWriteExt + Unpin,
 {
-    stream.write_u16(MAGIC).await?;
+    send_target_addr_with_type(stream, addr, ProtocolType::Tcp).await
+}
+
+pub async fn send_target_addr_with_type<S>(stream: &mut S, addr: &RemoteAddr, proto: ProtocolType) -> Result<()>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let magic = match proto {
+        ProtocolType::Tcp => MAGIC,
+        ProtocolType::UdpOverTcp => MAGIC_UDP,
+    };
+    stream.write_u16(magic).await?;
 
     match addr {
         RemoteAddr::SocketAddr(SocketAddr::V4(addr)) => {
@@ -41,13 +59,25 @@ pub async fn read_target_addr<S>(stream: &mut S) -> Result<RemoteAddr>
 where
     S: AsyncReadExt + Unpin,
 {
+    let (addr, _) = read_target_addr_with_type(stream).await?;
+    Ok(addr)
+}
+
+pub async fn read_target_addr_with_type<S>(stream: &mut S) -> Result<(RemoteAddr, ProtocolType)>
+where
+    S: AsyncReadExt + Unpin,
+{
     let magic = stream.read_u16().await?;
-    if magic != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid protocol magic",
-        ));
-    }
+    let proto = match magic {
+        MAGIC => ProtocolType::Tcp,
+        MAGIC_UDP => ProtocolType::UdpOverTcp,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid protocol magic",
+            ));
+        }
+    };
 
     let addr_type = stream.read_u8().await?;
 
@@ -57,14 +87,14 @@ where
             stream.read_exact(&mut ip_bytes).await?;
             let port = stream.read_u16().await?;
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip_bytes)), port);
-            Ok(RemoteAddr::SocketAddr(addr))
+            Ok((RemoteAddr::SocketAddr(addr), proto))
         }
         TYPE_IPV6 => {
             let mut ip_bytes = [0u8; 16];
             stream.read_exact(&mut ip_bytes).await?;
             let port = stream.read_u16().await?;
             let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip_bytes)), port);
-            Ok(RemoteAddr::SocketAddr(addr))
+            Ok((RemoteAddr::SocketAddr(addr), proto))
         }
         TYPE_DOMAIN => {
             let len = stream.read_u8().await?;
@@ -74,7 +104,7 @@ where
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid domain name")
             })?;
             let port = stream.read_u16().await?;
-            Ok(RemoteAddr::DomainName(domain, port))
+            Ok((RemoteAddr::DomainName(domain, port), proto))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

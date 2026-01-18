@@ -2,6 +2,7 @@ use std::io::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::SockMap;
 use super::{socket, batched};
@@ -10,6 +11,9 @@ use crate::trick::Ref;
 use crate::time::timeoutfut;
 use crate::dns::resolve_addr;
 use crate::endpoint::{RemoteAddr, ConnectOpts, BindOpts};
+
+#[cfg(feature = "transport")]
+use crate::kaminari::AsyncConnect;
 
 use batched::{Packet, SockAddrStore};
 use registry::Registry;
@@ -172,225 +176,188 @@ async fn send_back(
     log::debug!("[udp]remove association for {}", &laddr);
 }
 
-// Dynamic client mode: prepend target address to each UDP packet
+// Dynamic client mode: UDP over TCP (with TLS support)
 pub async fn run_dynamic_client(
     laddr: SocketAddr,
     proxy_addr: RemoteAddr,
     bind_opts: BindOpts,
     conn_opts: ConnectOpts,
 ) -> Result<()> {
-    let target_addr = conn_opts.remote_addr.as_ref().unwrap();
+    let target_addr = conn_opts.remote_addr.as_ref().unwrap().clone();
     let lis = Arc::new(socket::bind(&laddr, bind_opts)?);
-    let proxy_resolved = resolve_addr(&proxy_addr).await?.iter().next().unwrap();
 
-    log::info!("[udp][client]forwarding {} -> {} (target: {})", laddr, proxy_resolved, target_addr);
+    log::info!("[udp][client]forwarding {} -> {} (target: {}, over TCP)", laddr, proxy_addr, target_addr);
 
-    let sockmap = Arc::new(SockMap::new());
+    type TcpConnMap = std::collections::HashMap<SocketAddr, std::sync::mpsc::SyncSender<Vec<u8>>>;
+    let conn_map: Arc<std::sync::Mutex<TcpConnMap>> = Arc::new(std::sync::Mutex::new(TcpConnMap::new()));
+
     let mut buf = vec![0u8; 65535];
 
     loop {
         let (len, client_addr) = lis.recv_from(&mut buf).await?;
         let data = &buf[..len];
 
-        // Get or create connection to proxy
-        let proxy_sock = sockmap.find_or_insert(&client_addr, || {
-            let s = Arc::new(socket::associate(&proxy_resolved, &conn_opts)?);
-            tokio::spawn(recv_from_proxy(lis.clone(), client_addr, s.clone(), conn_opts.associate_timeout, sockmap.clone()));
-            log::info!("[udp][client]new association {} => {}", client_addr, proxy_resolved);
-            Result::Ok(s)
-        })?;
+        // Get or create TCP connection for this UDP client
+        let mut map = conn_map.lock().unwrap();
+        let tx = match map.get(&client_addr) {
+            Some(tx) => tx.clone(),
+            None => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(100);
 
-        // Encode target address + data
-        let mut packet = Vec::with_capacity(256 + len);
-        encode_target_addr(&mut packet, target_addr).await?;
-        packet.extend_from_slice(data);
+                let lis_clone = lis.clone();
+                let proxy_addr_clone = proxy_addr.clone();
+                let conn_opts_clone = conn_opts.clone();
+                let target_addr_clone = target_addr.clone();
+                let conn_map_clone = conn_map.clone();
 
-        proxy_sock.send(&packet).await?;
-    }
-}
+                tokio::spawn(async move {
+                    if let Err(e) = handle_tcp_to_proxy(
+                        lis_clone,
+                        client_addr,
+                        proxy_addr_clone,
+                        target_addr_clone,
+                        conn_opts_clone,
+                        rx,
+                    ).await {
+                        log::error!("[udp][client]TCP connection error for {}: {}", client_addr, e);
+                    }
+                    conn_map_clone.lock().unwrap().remove(&client_addr);
+                });
 
-// Dynamic server mode: extract target address from each UDP packet
-pub async fn run_dynamic_server(
-    laddr: SocketAddr,
-    bind_opts: BindOpts,
-    conn_opts: ConnectOpts,
-) -> Result<()> {
-    let lis = Arc::new(socket::bind(&laddr, bind_opts)?);
-    log::info!("[udp][server]listening on {} (dynamic mode)", laddr);
-
-    let sockmap = Arc::new(SockMap::new());
-    let mut buf = vec![0u8; 65535];
-
-    loop {
-        let (len, client_addr) = lis.recv_from(&mut buf).await?;
-        let data = &buf[..len];
-
-        // Decode target address from packet
-        let mut cursor = std::io::Cursor::new(data);
-        let target_addr = match decode_target_addr(&mut cursor).await {
-            Ok(addr) => addr,
-            Err(e) => {
-                log::error!("[udp][server]failed to decode target address: {}", e);
-                continue;
+                map.insert(client_addr, tx.clone());
+                tx
             }
         };
+        drop(map);
 
-        let payload_offset = cursor.position() as usize;
-        let payload = &data[payload_offset..];
-
-        // Get or create connection to target
-        let target_sock = sockmap.find_or_insert(&client_addr, || {
-            let target_resolved = futures::executor::block_on(resolve_addr(&target_addr))?.iter().next().unwrap();
-            let s = Arc::new(socket::associate(&target_resolved, &conn_opts)?);
-            tokio::spawn(recv_from_target(lis.clone(), client_addr, s.clone(), conn_opts.associate_timeout, sockmap.clone()));
-            log::info!("[udp][server]new association {} => {}", client_addr, target_addr);
-            Result::Ok(s)
-        })?;
-
-        target_sock.send(payload).await?;
-    }
-}
-
-async fn recv_from_proxy(
-    lis: Arc<UdpSocket>,
-    client_addr: SocketAddr,
-    proxy_sock: Arc<UdpSocket>,
-    timeout: usize,
-    sockmap: Arc<SockMap>,
-) {
-    let mut buf = vec![0u8; 65535];
-    loop {
-        match timeoutfut(proxy_sock.recv(&mut buf), timeout).await {
-            Err(_) => break,
-            Ok(Err(e)) => {
-                log::error!("[udp][client]recv error: {}", e);
-                break;
-            }
-            Ok(Ok(len)) => {
-                if let Err(e) = lis.send_to(&buf[..len], client_addr).await {
-                    log::error!("[udp][client]send error: {}", e);
-                    break;
-                }
-            }
+        // Send UDP data through TCP connection (blocking send with backpressure)
+        if let Err(e) = tx.send(data.to_vec()) {
+            log::error!("[udp][client]failed to send to TCP connection for {}: {}", client_addr, e);
         }
     }
-    sockmap.remove(&client_addr);
 }
 
-async fn recv_from_target(
+async fn handle_tcp_to_proxy(
     lis: Arc<UdpSocket>,
     client_addr: SocketAddr,
-    target_sock: Arc<UdpSocket>,
-    timeout: usize,
-    sockmap: Arc<SockMap>,
-) {
-    let mut buf = vec![0u8; 65535];
-    loop {
-        match timeoutfut(target_sock.recv(&mut buf), timeout).await {
-            Err(_) => break,
-            Ok(Err(e)) => {
-                log::error!("[udp][server]recv error: {}", e);
-                break;
-            }
-            Ok(Ok(len)) => {
-                if let Err(e) = lis.send_to(&buf[..len], client_addr).await {
-                    log::error!("[udp][server]send error: {}", e);
-                    break;
-                }
-            }
-        }
-    }
-    sockmap.remove(&client_addr);
-}
-
-async fn encode_target_addr<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    addr: &RemoteAddr,
+    proxy_addr: RemoteAddr,
+    target_addr: RemoteAddr,
+    conn_opts: ConnectOpts,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
+    // Establish TCP connection to proxy
+    let stream = crate::tcp::socket::connect(&proxy_addr, &conn_opts).await?;
 
-    const MAGIC: u16 = 0xAA55;
-    const TYPE_IPV4: u8 = 0x01;
-    const TYPE_IPV6: u8 = 0x02;
-    const TYPE_DOMAIN: u8 = 0x03;
-
-    writer.write_u16(MAGIC).await?;
-
-    match addr {
-        RemoteAddr::SocketAddr(SocketAddr::V4(addr)) => {
-            writer.write_u8(TYPE_IPV4).await?;
-            writer.write_all(&addr.ip().octets()).await?;
-            writer.write_u16(addr.port()).await?;
+    // Apply transport (TLS/WebSocket) if configured
+    #[cfg(feature = "transport")]
+    let stream = {
+        if let Some((_, ref cc)) = conn_opts.transport {
+            let mut buf = [0u8; 0];
+            cc.connect(stream, &mut buf).await?
+        } else {
+            use crate::kaminari::mix::MixClientStream;
+            MixClientStream::Plain(stream)
         }
-        RemoteAddr::SocketAddr(SocketAddr::V6(addr)) => {
-            writer.write_u8(TYPE_IPV6).await?;
-            writer.write_all(&addr.ip().octets()).await?;
-            writer.write_u16(addr.port()).await?;
+    };
+
+    #[cfg(not(feature = "transport"))]
+    let stream = stream;
+
+    log::info!("[udp][client]TCP connection established for {} => {}", client_addr, proxy_addr);
+
+    // Split stream into read and write halves
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    // Send target address first
+    crate::tcp::addr_proto::send_target_addr_with_type(&mut writer, &target_addr, crate::tcp::addr_proto::ProtocolType::UdpOverTcp).await?;
+    let response = crate::tcp::addr_proto::read_response(&mut reader).await?;
+    if response != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "server rejected target address"));
+    }
+
+    log::info!("[udp][client]TCP connection ready for {} => {}", client_addr, proxy_addr);
+
+    // Spawn task to read from TCP and send to UDP client
+    let lis_clone = lis.clone();
+    tokio::spawn(async move {
+        log::debug!("[udp][client]spawn task started for {}", client_addr);
+        let mut buf = vec![0u8; 65535];
+        loop {
+            log::debug!("[udp][client]waiting to read from TCP for {}", client_addr);
+            match read_udp_packet(&mut reader, &mut buf).await {
+                Ok(len) => {
+                    log::debug!("[udp][client]received {} bytes from TCP, sending to UDP client {}", len, client_addr);
+
+                    // Convert IPv4-mapped IPv6 address to IPv4 if needed
+                    let target_addr = match client_addr {
+                        SocketAddr::V6(v6) => {
+                            if let Some(ipv4) = v6.ip().to_ipv4_mapped() {
+                                SocketAddr::new(std::net::IpAddr::V4(ipv4), v6.port())
+                            } else {
+                                client_addr
+                            }
+                        }
+                        _ => client_addr,
+                    };
+
+                    if let Err(e) = lis_clone.send_to(&buf[..len], target_addr).await {
+                        log::error!("[udp][client]failed to send to UDP client {}: {}", target_addr, e);
+                        break;
+                    }
+                    log::debug!("[udp][client]successfully sent {} bytes to UDP client {}", len, target_addr);
+                }
+                Err(e) => {
+                    log::debug!("[udp][client]TCP read closed for {}: {}", client_addr, e);
+                    break;
+                }
+            }
         }
-        RemoteAddr::DomainName(domain, port) => {
-            writer.write_u8(TYPE_DOMAIN).await?;
-            writer.write_u8(domain.len() as u8).await?;
-            writer.write_all(domain.as_bytes()).await?;
-            writer.write_u16(*port).await?;
+        log::debug!("[udp][client]spawn task ended for {}", client_addr);
+    });
+
+    // Read from channel and send to TCP
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    loop {
+        let rx_clone = rx.clone();
+        let data = match tokio::task::spawn_blocking(move || {
+            rx_clone.lock().unwrap().recv()
+        }).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(_)) => {
+                log::debug!("[udp][client]channel closed for {}", client_addr);
+                break;
+            }
+            Err(e) => {
+                log::error!("[udp][client]spawn_blocking failed: {}", e);
+                break;
+            }
+        };
+        log::debug!("[udp][client]sending {} bytes to TCP for {}", data.len(), client_addr);
+        if let Err(e) = write_udp_packet(&mut writer, &data).await {
+            log::error!("[udp][client]failed to write to TCP: {}", e);
+            return Err(e);
         }
     }
 
     Ok(())
 }
 
-async fn decode_target_addr<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<RemoteAddr> {
-    use tokio::io::AsyncReadExt;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    const MAGIC: u16 = 0xAA55;
-    const TYPE_IPV4: u8 = 0x01;
-    const TYPE_IPV6: u8 = 0x02;
-    const TYPE_DOMAIN: u8 = 0x03;
-
-    let magic = reader.read_u16().await?;
-    if magic != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid magic",
-        ));
+// Helper functions for UDP packet framing over TCP
+async fn write_udp_packet<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
+    if data.len() > 65535 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "UDP packet too large"));
     }
+    writer.write_u16(data.len() as u16).await?;
+    writer.write_all(data).await?;
+    writer.flush().await?;
+    Ok(())
+}
 
-    let addr_type = reader.read_u8().await?;
-
-    match addr_type {
-        TYPE_IPV4 => {
-            let mut ip_bytes = [0u8; 4];
-            reader.read_exact(&mut ip_bytes).await?;
-            let port = reader.read_u16().await?;
-            Ok(RemoteAddr::SocketAddr(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::from(ip_bytes)),
-                port,
-            )))
-        }
-        TYPE_IPV6 => {
-            let mut ip_bytes = [0u8; 16];
-            reader.read_exact(&mut ip_bytes).await?;
-            let port = reader.read_u16().await?;
-            Ok(RemoteAddr::SocketAddr(SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::from(ip_bytes)),
-                port,
-            )))
-        }
-        TYPE_DOMAIN => {
-            let len = reader.read_u8().await?;
-            let mut domain_bytes = vec![0u8; len as usize];
-            reader.read_exact(&mut domain_bytes).await?;
-            let domain = String::from_utf8(domain_bytes).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid domain")
-            })?;
-            let port = reader.read_u16().await?;
-            Ok(RemoteAddr::DomainName(domain, port))
-        }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unknown address type",
-        )),
+async fn read_udp_packet<R: AsyncReadExt + Unpin>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let len = reader.read_u16().await? as usize;
+    if len > buf.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP packet too large"));
     }
+    reader.read_exact(&mut buf[..len]).await?;
+    Ok(len)
 }

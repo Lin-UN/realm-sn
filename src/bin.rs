@@ -52,6 +52,7 @@ fn start_from_conf(full: FullConf) {
     let FullConf {
         log: log_conf,
         dns: dns_conf,
+        network: network_conf,
         endpoints: endpoints_conf,
         ..
     } = full;
@@ -60,13 +61,79 @@ fn start_from_conf(full: FullConf) {
     setup_dns(dns_conf);
     setup_transport();
 
+    let network_info = realm::conf::Config::build(network_conf);
+    let auto_bind_all_ips = network_info.auto_bind_all_ips;
+
     let endpoints: Vec<EndpointInfo> = endpoints_conf
         .into_iter()
-        .map(Config::build)
+        .flat_map(|conf| {
+            // Check if listen address is a wildcard (0.0.0.0 or ::)
+            let listen_addr = conf.listen.parse::<std::net::SocketAddr>().ok();
+            let should_expand = auto_bind_all_ips && listen_addr.map(|addr| {
+                addr.ip().is_unspecified()
+            }).unwrap_or(false);
+
+            if should_expand {
+                // Enumerate all network interfaces and create an endpoint for each IP
+                expand_wildcard_endpoint(&conf, listen_addr.unwrap())
+            } else {
+                vec![Config::build(conf)]
+            }
+        })
         .inspect(|x| println!("inited: {}", x.endpoint))
         .collect();
 
     execute(endpoints);
+}
+
+fn expand_wildcard_endpoint(conf: &realm::conf::EndpointConf, wildcard_addr: std::net::SocketAddr) -> Vec<EndpointInfo> {
+    use if_addrs::get_if_addrs;
+
+    let port = wildcard_addr.port();
+    let is_ipv6 = wildcard_addr.is_ipv6();
+
+    match get_if_addrs() {
+        Ok(interfaces) => {
+            let endpoints: Vec<EndpointInfo> = interfaces
+                .into_iter()
+                .filter_map(|iface| {
+                    let ip = iface.ip();
+
+                    // Filter by IP version
+                    if is_ipv6 && !ip.is_ipv6() {
+                        return None;
+                    }
+                    if !is_ipv6 && !ip.is_ipv4() {
+                        return None;
+                    }
+
+                    // Skip loopback addresses
+                    if ip.is_loopback() {
+                        return None;
+                    }
+
+                    // Create new endpoint config with specific IP
+                    let new_addr = std::net::SocketAddr::new(ip, port);
+                    let mut new_conf = conf.clone();
+                    new_conf.listen = new_addr.to_string();
+
+                    println!("auto-expanded: {} (from {})", new_addr, iface.name);
+                    Some(Config::build(new_conf))
+                })
+                .collect();
+
+            if endpoints.is_empty() {
+                println!("warning: no suitable network interfaces found, using original wildcard address");
+                vec![Config::build(conf.clone())]
+            } else {
+                endpoints
+            }
+        }
+        Err(e) => {
+            println!("warning: failed to enumerate network interfaces: {}, using original wildcard address", e);
+            vec![Config::build(conf.clone())]
+        }
+    }
 }
 
 fn setup_log(log: LogConf) {
@@ -140,6 +207,7 @@ async fn run(endpoints: Vec<EndpointInfo>) {
             workers.push(tokio::spawn(run_udp(endpoint.clone())));
         }
 
+        // Always start TCP unless explicitly disabled
         if !no_tcp {
             workers.push(tokio::spawn(run_tcp(endpoint)));
         }

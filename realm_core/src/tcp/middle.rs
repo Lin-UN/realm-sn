@@ -206,57 +206,197 @@ async fn server_mode_relay(
         let mut local_stream = ac.accept(local, &mut buf).await?;
 
         // Read target address after handshake
-        let target_addr = addr_proto::read_target_addr(&mut local_stream).await?;
-        log::info!("[tcp][server]target address: {}", target_addr);
+        let (target_addr, proto_type) = addr_proto::read_target_addr_with_type(&mut local_stream).await?;
+        log::info!("[tcp][server]target address: {}, protocol: {:?}", target_addr, proto_type);
 
-        // Connect to target
-        let mut remote = match socket::connect(&target_addr, conn_opts.as_ref()).await {
-            Ok(r) => {
-                addr_proto::send_response(&mut local_stream, 0x00).await?;
-                r
+        // Route based on protocol type
+        match proto_type {
+            addr_proto::ProtocolType::Tcp => {
+                // TCP relay
+                let mut remote = match socket::connect(&target_addr, conn_opts.as_ref()).await {
+                    Ok(r) => {
+                        addr_proto::send_response(&mut local_stream, 0x00).await?;
+                        r
+                    }
+                    Err(e) => {
+                        addr_proto::send_response(&mut local_stream, 0x01).await?;
+                        return Err(e);
+                    }
+                };
+
+                log::info!("[tcp][server]connected to target: {}", target_addr);
+
+                // Relay data
+                let buf1 = realm_io::CopyBuffer::new(buf);
+                let buf2 = realm_io::CopyBuffer::new(vec![0; realm_io::buf_size()]);
+                let res = realm_io::bidi_copy_buf(&mut local_stream, &mut remote, buf1, buf2).await;
+                if let Err(e) = res {
+                    log::debug!("[tcp][server]forward error: {}, ignored", e);
+                }
+                return Ok(());
             }
-            Err(e) => {
-                addr_proto::send_response(&mut local_stream, 0x01).await?;
-                return Err(e);
+            addr_proto::ProtocolType::UdpOverTcp => {
+                // UDP over TCP relay
+                use crate::udp::associate;
+                use crate::dns::resolve_addr;
+                use std::sync::Arc;
+
+                // Resolve target address
+                let target_resolved = resolve_addr(&target_addr).await?.iter().next().unwrap();
+
+                // Create UDP socket to target and connect it
+                let target_sock = associate(&target_resolved, conn_opts.as_ref())?;
+                target_sock.connect(target_resolved).await?;
+                let target_sock = Arc::new(target_sock);
+
+                // Send success response
+                addr_proto::send_response(&mut local_stream, 0).await?;
+
+                log::info!("[udp][server]UDP over TCP connection ready for target: {}", target_addr);
+
+                // Split stream into read and write halves
+                let (mut reader, mut writer) = tokio::io::split(local_stream);
+
+                // Spawn task to read from UDP target and send to TCP client
+                let target_sock_clone = target_sock.clone();
+                tokio::spawn(async move {
+                    log::debug!("[udp][server]spawn task started for UDP target");
+                    let mut buf = vec![0u8; 65535];
+                    loop {
+                        log::debug!("[udp][server]waiting to read from UDP target");
+                        match target_sock_clone.recv(&mut buf).await {
+                            Ok(len) => {
+                                log::debug!("[udp][server]received {} bytes from target, sending to TCP", len);
+                                if let Err(e) = write_udp_packet(&mut writer, &buf[..len]).await {
+                                    log::error!("[udp][server]failed to write to TCP: {}", e);
+                                    break;
+                                }
+                                log::debug!("[udp][server]successfully sent {} bytes to TCP", len);
+                            }
+                            Err(e) => {
+                                log::error!("[udp][server]failed to read from UDP target: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    log::debug!("[udp][server]spawn task ended for UDP target");
+                });
+
+                // Read from TCP and send to UDP target
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    let len = read_udp_packet(&mut reader, &mut buf).await?;
+                    log::debug!("[udp][server]received {} bytes from TCP, sending to target", len);
+                    target_sock.send(&buf[..len]).await?;
+                }
             }
-        };
-
-        log::info!("[tcp][server]connected to target: {}", target_addr);
-
-        // Relay data
-        let buf1 = realm_io::CopyBuffer::new(buf);
-        let buf2 = realm_io::CopyBuffer::new(vec![0; realm_io::buf_size()]);
-        let res = realm_io::bidi_copy_buf(&mut local_stream, &mut remote, buf1, buf2).await;
-        if let Err(e) = res {
-            log::debug!("[tcp][server]forward error: {}, ignored", e);
         }
-        return Ok(());
     }
 
     // Without transport, read target address directly
     let mut local = local;
-    let target_addr = addr_proto::read_target_addr(&mut local).await?;
-    log::info!("[tcp][server]target address: {}", target_addr);
+    let (target_addr, proto_type) = addr_proto::read_target_addr_with_type(&mut local).await?;
+    log::info!("[tcp][server]target address: {}, protocol: {:?}", target_addr, proto_type);
 
-    // Connect to target
-    let remote = match socket::connect(&target_addr, conn_opts.as_ref()).await {
-        Ok(r) => {
-            addr_proto::send_response(&mut local, 0x00).await?;
-            r
+    // Route based on protocol type
+    match proto_type {
+        addr_proto::ProtocolType::Tcp => {
+            // TCP relay
+            let remote = match socket::connect(&target_addr, conn_opts.as_ref()).await {
+                Ok(r) => {
+                    addr_proto::send_response(&mut local, 0x00).await?;
+                    r
+                }
+                Err(e) => {
+                    addr_proto::send_response(&mut local, 0x01).await?;
+                    return Err(e);
+                }
+            };
+
+            log::info!("[tcp][server]connected to target: {}", target_addr);
+
+            // Start relay
+            let res = plain::run_relay(local, remote).await;
+            if let Err(e) = res {
+                log::debug!("[tcp][server]forward error: {}, ignored", e);
+            }
+
+            Ok(())
         }
-        Err(e) => {
-            addr_proto::send_response(&mut local, 0x01).await?;
-            return Err(e);
+        addr_proto::ProtocolType::UdpOverTcp => {
+            // UDP over TCP relay (without transport)
+            use crate::udp::associate;
+            use crate::dns::resolve_addr;
+            use std::sync::Arc;
+
+            // Resolve target address
+            let target_resolved = resolve_addr(&target_addr).await?.iter().next().unwrap();
+
+            // Create UDP socket to target and connect it
+            let target_sock = associate(&target_resolved, conn_opts.as_ref())?;
+            target_sock.connect(target_resolved).await?;
+            let target_sock = Arc::new(target_sock);
+
+            // Send success response
+            addr_proto::send_response(&mut local, 0).await?;
+
+            log::info!("[udp][server]UDP over TCP connection ready for target: {}", target_addr);
+
+            // Split stream into read and write halves
+            let (mut reader, mut writer) = tokio::io::split(local);
+
+            // Spawn task to read from UDP target and send to TCP client
+            let target_sock_clone = target_sock.clone();
+            tokio::spawn(async move {
+                log::debug!("[udp][server]spawn task started for UDP target (no transport)");
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    log::debug!("[udp][server]waiting to read from UDP target (no transport)");
+                    match target_sock_clone.recv(&mut buf).await {
+                        Ok(len) => {
+                            log::debug!("[udp][server]received {} bytes from target, sending to TCP", len);
+                            if let Err(e) = write_udp_packet(&mut writer, &buf[..len]).await {
+                                log::error!("[udp][server]failed to write to TCP: {}", e);
+                                break;
+                            }
+                            log::debug!("[udp][server]successfully sent {} bytes to TCP", len);
+                        }
+                        Err(e) => {
+                            log::error!("[udp][server]failed to read from UDP target: {}", e);
+                            break;
+                        }
+                    }
+                }
+                log::debug!("[udp][server]spawn task ended for UDP target (no transport)");
+            });
+
+            // Read from TCP and send to UDP target
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let len = read_udp_packet(&mut reader, &mut buf).await?;
+                log::debug!("[udp][server]received {} bytes from TCP, sending to target", len);
+                target_sock.send(&buf[..len]).await?;
+            }
         }
-    };
-
-    log::info!("[tcp][server]connected to target: {}", target_addr);
-
-    // Start relay
-    let res = plain::run_relay(local, remote).await;
-    if let Err(e) = res {
-        log::debug!("[tcp][server]forward error: {}, ignored", e);
     }
+}
 
+// Helper functions for UDP packet framing over TCP
+async fn write_udp_packet<W: tokio::io::AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
+    if data.len() > 65535 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "UDP packet too large"));
+    }
+    writer.write_u16(data.len() as u16).await?;
+    writer.write_all(data).await?;
+    writer.flush().await?;
     Ok(())
+}
+
+async fn read_udp_packet<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let len = reader.read_u16().await? as usize;
+    if len > buf.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP packet too large"));
+    }
+    reader.read_exact(&mut buf[..len]).await?;
+    Ok(len)
 }

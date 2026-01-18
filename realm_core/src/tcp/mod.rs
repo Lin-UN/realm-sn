@@ -1,9 +1,9 @@
 //! TCP relay entrance.
 
-mod socket;
+pub(crate) mod socket;
 mod middle;
 mod plain;
-mod addr_proto;
+pub(crate) mod addr_proto;
 
 #[cfg(feature = "hook")]
 mod hook;
